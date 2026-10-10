@@ -50,7 +50,7 @@ flowchart TB
 | `0x5000_0000` | 4 KB | FIR accelerator | 4 channels |
 | `0x6000_0000` | 4 KB | I2C master | MAX30102 at address `0x57` |
 
-Unmapped addresses return `0xDEADBEEF` instead of hanging the core. The full register-level reference for driver authors is in [`docs/REGISTERS.md`](docs/REGISTERS.md).
+Unmapped addresses return `0xDEADBEEF` instead of hanging the core. 
 
 ### Interrupts
 
