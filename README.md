@@ -1,393 +1,144 @@
 # VitalSoC
-VitalSoC is a small computer built inside an FPGA, designed around cardiac signals.
 
-<img width="639" height="425" alt="image" src="https://github.com/user-attachments/assets/a191aa2b-fddc-4a80-bb83-6135182d4d32" />
+**A configurable RISC-V SoC for hardware-accelerated multi-modal physiological signal processing.**
 
-# VitalSoC — RISC-V SoC for Biomedical Signal Processing
+VitalSoC is a small System-on-Chip built around the open-source [PicoRV32](https://github.com/YosysHQ/picorv32) RISC-V core and implemented on a Xilinx 7-series FPGA (Digilent Boolean Spartan-7 or ZedBoard). Its main addition is a memory-mapped, four-channel FIR filter accelerator that cleans ECG and PPG signals in real time, so the processor stays free for sensing, communication and decision logic. A resident UART bootloader lets you load new firmware without rebuilding the bitstream, so the SoC behaves like a reprogrammable microcontroller.
 
-VitalSoC is a RISC-V-based System-on-Chip (SoC) designed for real-time biomedical signal processing. It integrates a PicoRV32 processor with a dedicated Finite Impulse Response (FIR) hardware accelerator to support efficient filtering of sampled physiological signals such as ECG and PPG.
+> **Not a medical device.** VitalSoC is a signal-processing and system-integration platform. It does not diagnose anything, and any SpO2 value would be an uncalibrated estimate.
 
-The project explores hardware/software co-design by combining a lightweight processor for system control and higher-level algorithms with a dedicated DSP datapath for computationally repetitive signal-processing operations.
+---
 
-## Table of Contents
+## Why this project
 
-- [Overview](#overview)
-- [Key Features](#key-features)
-- [System Architecture](#system-architecture)
-- [FIR Accelerator](#fir-accelerator)
-- [Fixed-Point Arithmetic](#fixed-point-arithmetic)
-- [Memory-Mapped Interface](#memory-mapped-interface)
-- [Repository Structure](#repository-structure)
-- [Design Specifications](#design-specifications)
-- [Verification and Evaluation](#verification-and-evaluation)
-- [Applications](#applications)
-- [Future Work](#future-work)
-- [References](#references)
+ECG and PPG signals are noisy: baseline wander, 50/60 Hz mains pickup, muscle and motion artefacts. Heart-rate and pulse-oximetry algorithms need them filtered on a fixed schedule, every sample. Software filtering on a small processor costs cycles and ties timing to the rest of the firmware, while fixed-function chips cannot be adapted to a new sensor or filter. VitalSoC shows a middle path: a programmable processor plus a small, reconfigurable hardware filter on one low-cost FPGA.
 
-## Overview
+## Features
 
-Biomedical signals are often affected by noise, baseline drift, and interference. Digital filtering is an important preprocessing step before performing operations such as peak detection, heart-rate estimation, and physiological parameter analysis.
+- **PicoRV32 (RV32IMC)** with hardware multiply and divide and interrupts, on its native memory interface (no AXI).
+- **4-channel FIR accelerator.** One shared multiply-accumulate unit, a separate 64-tap coefficient bank and delay line per channel, Q1.15 coefficients, 40-bit accumulator, saturating 16-bit output, done interrupt. About 67 clock cycles per sample.
+- **Run-time configurable.** Coefficients are loaded over the bus, so a channel can be an ECG band-pass, a PPG low-pass, or any other FIR filter without re-synthesis.
+- **UART bootloader.** A 2 KB boot ROM receives the application over UART into RAM and jumps to it.
+- **Peripherals:** UART, timer with interrupt, GPIO (LEDs, switches, buttons), and an I2C master for a MAX30102 PPG sensor.
+- **Bit-exact verification.** Self-checking testbenches compare the RTL against a Python fixed-point model.
 
-Executing repetitive filtering operations entirely in software can consume processor cycles that could otherwise be used for system control and higher-level algorithms.
+## Architecture
 
-VitalSoC addresses this design challenge through a hardware/software co-design approach:
-
-- **PicoRV32 processor:** Executes firmware, controls peripherals, and performs system-level processing.
-- **FIR accelerator:** Performs multiply-accumulate operations for digital filtering.
-- **Memory-mapped interface:** Allows firmware to configure the accelerator and exchange data.
-- **Interrupt support:** Provides a mechanism for notifying the processor when processing is complete, subject to the implemented control logic.
-
-## Key Features
-
-- PicoRV32-based RISC-V processor integration.
-- Dedicated FIR accelerator for digital signal processing.
-- Four independently addressed signal channels.
-- 64-tap FIR filtering per channel.
-- Signed 16-bit input samples and coefficients.
-- Q1.15 fixed-point coefficient representation.
-- 40-bit accumulation datapath.
-- Output scaling and saturation logic.
-- Circular-buffer-based sample history.
-- Runtime-accessible coefficient memory.
-- Memory-mapped control and data registers.
-- Hardware/software partitioning for efficient resource utilization.
-
-## System Architecture
-
-VitalSoC separates system-level control from computationally intensive filtering operations.
-
-```text
-                  Biomedical Sensors
-                          |
-                          v
-                    Signal Acquisition
-                          |
-                          v
-                       ADC Data
-                          |
-                          v
-                 +-------------------+
-                 |     PicoRV32      |
-                 |   RISC-V Core     |
-                 +---------+---------+
-                           |
-                     System Bus
-                           |
-                 +---------v---------+
-                 |   FIR Peripheral  |
-                 |   fir_periph.v    |
-                 +---------+---------+
-                           |
-                 +---------v---------+
-                 |     FIR Core      |
-                 |   fir_core.v      |
-                 |                   |
-                 |  Sample Buffer    |
-                 |  Coefficient RAM  |
-                 |  Multiplier       |
-                 |  Accumulator      |
-                 |  Saturation       |
-                 +---------+---------+
-                           |
-                           v
-                    Filtered Samples
-                           |
-                           v
-                 Higher-Level Processing
+```mermaid
+flowchart TB
+    CPU["PicoRV32<br/>RV32IMC + IRQ"] --> BUS
+    ROM["Boot ROM 2 KB<br/>UART bootloader"] --> BUS
+    RAM["App RAM 64 KB<br/>loaded over UART"] --> BUS
+    BUS["Memory-mapped bus<br/>address decoder + IRQ collector"]
+    BUS --> UART["UART<br/>115200 baud"]
+    BUS --> GPIO["GPIO<br/>LEDs, switches, buttons"]
+    BUS --> TMR["Timer<br/>irq 3"]
+    BUS --> FIR["FIR x4<br/>irq 4"]
+    BUS --> I2C["I2C master<br/>irq 5"]
+    UART --- PC["Host PC"]
+    I2C --- PPG["MAX30102<br/>PPG sensor"]
 ```
 
-### Processor responsibilities
+### Memory map (target)
 
-The PicoRV32 processor is responsible for:
+| Base address | Size | Block | Notes |
+|---|---|---|---|
+| `0x0000_0000` | 2 KB | Boot ROM | Reset vector, read-only |
+| `0x1000_0000` | 64 KB | App RAM | Application is uploaded here |
+| `0x2000_0000` | 4 KB | UART | Data and status registers |
+| `0x3000_0000` | 4 KB | GPIO | LEDs, switches, buttons |
+| `0x4000_0000` | 4 KB | Timer | 1 kHz tick by default |
+| `0x5000_0000` | 4 KB | FIR accelerator | 4 channels |
+| `0x6000_0000` | 4 KB | I2C master | MAX30102 at address `0x57` |
 
-- Initializing and configuring the FIR peripheral.
-- Supplying input samples.
-- Selecting the signal channel.
-- Managing processing completion.
-- Executing higher-level biomedical algorithms.
-- Handling communication and system control.
+Unmapped addresses return `0xDEADBEEF` instead of hanging the core. The full register-level reference for driver authors is in [`docs/REGISTERS.md`](docs/REGISTERS.md).
 
-### Accelerator responsibilities
+### Interrupts
 
-The FIR hardware performs:
+| Line | Source |
+|---|---|
+| `irq[3]` | Timer tick |
+| `irq[4]` | FIR done |
+| `irq[5]` | I2C transfer complete |
 
-- Sample-history management.
-- Coefficient retrieval.
-- Multiply-accumulate operations.
-- Fixed-point scaling.
-- Output saturation.
-- Processing-status and completion signalling.
+`irq[0..2]` are used internally by PicoRV32.
 
-## FIR Accelerator
+## The FIR accelerator
 
-The FIR accelerator implements a 64-tap finite impulse response filter. For each output sample, it calculates the weighted sum of the current input and 63 previous samples.
+The CPU only sees a few registers at `0x5000_0000`:
 
-The discrete-time filtering equation is:
+| Offset | Register | Purpose |
+|---|---|---|
+| `0x00` | `CTRL` | Start, interrupt enable, channel select |
+| `0x04` | `STATUS` | Busy, done (write 1 to clear) |
+| `0x08` | `DATA_IN` | Signed 16-bit sample |
+| `0x0C` | `DATA_OUT` | Filtered sample |
+| `0x10` | `COEF_ADDR` | `{channel, tap}` |
+| `0x14` | `COEF_DATA` | Coefficient; the write triggers the store |
 
-\[
-y[n]=\sum_{k=0}^{63}c_kx[n-k]
-\]
-
-where:
-
-- \(x[n-k]\) is the input sample at tap \(k\).
-- \(c_k\) is the corresponding filter coefficient.
-- \(y[n]\) is the filtered output.
-
-### Time-multiplexed multiply-accumulate datapath
-
-Rather than implementing a separate multiplier for every tap, the design reuses a multiplier across successive processing cycles.
-
-```text
- Sample History             Coefficient Memory
-       |                            |
-       v                            v
- +-------------+              +-------------+
- | Sample Read |              | Coefficient |
- |   Address   |              |    Read     |
- +------+------+              +------+------+
-        |                            |
-        +-------------+--------------+
-                      |
-                      v
-               +-------------+
-               | Multiplier  |
-               |   16 x 16   |
-               +------+------+
-                      |
-                      v
-               +-------------+
-               | 40-bit      |
-               | Accumulator|
-               +------+------+
-                      |
-                      v
-               +-------------+
-               | Scaling and |
-               | Saturation  |
-               +------+------+
-                      |
-                      v
-                 16-bit Output
-```
-
-For every output sample, the accelerator performs 64 multiplications and accumulates the resulting products.
-
-This architecture trades parallel processing resources for additional processing cycles. It is suitable for applications where the sample arrival rate is low relative to the available FPGA clock frequency.
-
-### Circular sample buffer
-
-The accelerator maintains sample history using a circular buffer.
-
-For four channels with 64 samples per channel, the logical sample storage requirement is:
-
-\[
-4\times64=256\text{ samples}
-\]
-
-A channel-specific head pointer identifies the most recently stored sample. Earlier samples are accessed through tap-index arithmetic, avoiding the need to shift the entire sample history whenever a new sample arrives.
-
-### Coefficient storage
-
-The coefficient memory provides storage for the filter coefficients associated with each channel.
-
-The logical coefficient storage requirement is:
-
-\[
-4\times64=256\text{ coefficients}
-\]
-
-The memory-mapped interface may be used to update coefficients at runtime, according to the implemented peripheral functionality.
-
-## Fixed-Point Arithmetic
-
-The accelerator uses signed 16-bit samples and signed 16-bit coefficients. Coefficients are represented in Q1.15 fixed-point format.
-
-The coefficient value is interpreted as:
-
-\[
-c_{\text{real}}=\frac{c_{\text{integer}}}{2^{15}}
-\]
-
-For example, an integer coefficient of 16384 represents 0.5.
-
-### Multiplication and accumulation
-
-Multiplying two signed 16-bit values produces a signed 32-bit product:
-
-\[
-16\text{-bit}\times16\text{-bit}
-\rightarrow32\text{-bit}
-\]
-
-The products are accumulated in a 40-bit datapath to provide additional headroom during summation.
-
-### Output scaling
-
-After accumulation, the result is shifted right by 15 bits to account for the coefficient's fractional scaling.
-
-\[
-y_{\text{scaled}}=acc\mathbin{\text{>>>}}15
-\]
-
-The arithmetic right shift preserves the sign of the accumulated result.
-
-### Saturation
-
-The final result is limited to the signed 16-bit range:
-
-\[
--32768\leq y[n]\leq32767
-\]
-
-Values above the positive limit are clipped to 32767, while values below the negative limit are clipped to -32768. Results within the valid range are retained.
-
-Saturation prevents out-of-range results from wrapping around when converted to a 16-bit output.
-
-## Memory-Mapped Interface
-
-The FIR peripheral provides a register-based interface between the processor and the accelerator.
-
-The following offsets describe the interface documented for the current design; confirm the exact register widths, access rules, and status-bit definitions against `fir_periph.v`.
-
-| Register | Offset | Purpose |
-|---|---:|---|
-| `FIR_CTRL` | `0x00` | Start processing and select channel |
-| `FIR_DATA_IN` | `0x08` | Input sample |
-| `FIR_DATA_OUT` | `0x0C` | Filtered output |
-| `FIR_STATUS` | Verify RTL | Processing status and completion |
-
-### Typical software transaction
-
-1. Write an input sample to `FIR_DATA_IN`.
-2. Select the channel and initiate processing through `FIR_CTRL`.
-3. Wait for the completion status or an interrupt, if supported and enabled.
-4. Read the filtered output from `FIR_DATA_OUT`.
-5. Clear the completion status according to the implemented register semantics.
-
-Conceptual pseudocode:
+Filtering one sample from C:
 
 ```c
-write_reg(FIR_DATA_IN, sample);
-write_reg(FIR_CTRL, (channel << 8) | 1);
-
-while (!(read_reg(FIR_STATUS) & DONE_MASK)) {
-    // Wait for processing completion.
-}
-
-result = read_reg(FIR_DATA_OUT);
+FIR_DATA_IN = sample;            // 1. write the input
+FIR_CTRL    = (ch << 8) | 1;     // 2. channel + start
+while (!(FIR_STATUS & 2)) ;      // 3. wait for done (or use irq[4])
+y = (int16_t)FIR_DATA_OUT;       // 4. read the result
+FIR_STATUS = 2;                  // 5. clear done
 ```
 
-The register addresses, `DONE_MASK`, and status-clearing operation must match the actual peripheral implementation. The code above is illustrative rather than a drop-in firmware driver.
+Computation, per channel: `y[n] = saturate16( (sum of coef[k] * x[n-k], k = 0..63) >> 15 )`.
 
-## Repository Structure
+Default channel plan (generated by `model/fir_golden.py`):
 
-```text
-VitalSoC/
-├── DSP/
-│   └── vitalsoc_fir/
-│       ├── fir_core.v
-│       ├── fir_periph.v
-│       └── model/
-├── README.md
-└── ...
+| Channel | Signal | Filter | Rate |
+|---|---|---|---|
+| 0 | ECG (QRS detection) | Band-pass 5 to 25 Hz | 250 Hz |
+| 1 | PPG red | Low-pass 4 Hz | 100 Hz |
+| 2 | PPG IR | Low-pass 4 Hz | 100 Hz |
+| 3 | ECG (spare, self-test) | Low-pass 40 Hz | 250 Hz |
+
+
+## Repository layout
+
+```
+rtl/            Verilog: fir_core, fir_periph, vitalsoc_top, soc_timer, soc_gpio, bram32
+tb/             Testbenches and test vectors (.mem)
+model/          Python golden model, coefficient and vector generators
+fw/             Firmware: startup, linker script, drivers, DSP code, host test
+constraints/    Board constraint files (verify every pin before use)
+docs/           Register reference and design notes
 ```
 
-The tree above highlights the FIR-related files currently identified. Additional directories and files should be documented as the repository develops.
+## Results
 
-| File or directory | Description |
+
+| Metric | Value |
 |---|---|
-| `DSP/vitalsoc_fir/fir_core.v` | FIR computation datapath and control logic |
-| `DSP/vitalsoc_fir/fir_periph.v` | Peripheral register and processor-interface logic |
-| `DSP/vitalsoc_fir/model/` | Model-related files; exact contents should be documented from the repository |
+| LUT / FF / DSP / BRAM | 2826/1837/1/18 |
+| Worst negative slack at 100 MHz | 0.251ns |
+| FIR accelerator, cycles per sample | about 67 (simulation, accelerator only) |
+| Software FIR, cycles per sample | pending |
+| Speed-up | pending (estimated to be around 30x)|
 
-## Design Specifications
+## Intended applications
 
-| Parameter | Specification |
-|---|---|
-| Processor | PicoRV32 |
-| Accelerator | Finite Impulse Response (FIR) filter |
-| Number of channels | 4 |
-| Taps per channel | 64 |
-| Input width | 16 bits, signed |
-| Coefficient width | 16 bits, signed |
-| Coefficient format | Q1.15 |
-| Product width | 32 bits |
-| Accumulator width | 40 bits |
-| Output width | 16 bits |
-| Sample-history capacity | 256 logical samples |
-| Coefficient capacity | 256 logical coefficients |
-| Processing architecture | Time-multiplexed MAC |
+Home and remote heart-rate monitoring, wearable pulse sensing, worker-safety alerts, a pre-processing front end for edge-AI arrhythmia classifiers, a teaching platform for RISC-V SoC design, and a prototype for low-power health-monitoring chips. These are intended uses, only the filtering, heart-rate reporting and reprogrammable workflow are demonstrated by this project.
 
-The exact clock frequency, measured latency, FPGA resource usage, and achieved timing should be reported from simulation and synthesis results rather than inferred from the architecture alone.
+## Limitations
 
-## Verification and Evaluation
+- ECG is replayed from a stored test vector. Live ECG acquisition is not part of the current scope.
+- The software FIR uses a 32-bit accumulator, which is fine for ECG-sized inputs but can overflow on full-scale signals. The hardware uses 40 bits.
+- A CPU reset does not clear FIR coefficients or delay lines. The firmware must reload coefficients and flush every channel on start-up.
+- The UART bootloader loads RAM only. A power cycle or reset requires a new upload.
+- Heart-rate detection is a simple adaptive-threshold detector, not clinically validated.
 
-The following tests are recommended for validating the FIR core and its integration.
+## Team
 
-### Functional verification
-
-- Reset and initialization.
-- Impulse response.
-- Constant input and DC gain.
-- Positive and negative input samples.
-- Channel isolation.
-- Circular-buffer wraparound.
-- Coefficient read/write behaviour.
-- Output scaling and saturation.
-- Completion status and interrupt behaviour.
-- Back-to-back processing requests.
-- Comparison against a software reference model.
-
-### Performance evaluation
-
-Evaluate the design using:
-
-- LUT and flip-flop utilization.
-- DSP block utilization.
-- Memory resource utilization.
-- Maximum achievable clock frequency.
-- Processing latency per output sample.
-- Maximum sustainable sample rate.
-- Power consumption, if measured.
-
-For a 100 MHz implementation, one clock cycle is 10 ns. A 67-cycle operation would correspond to 670 ns, or 0.67 µs. This is a theoretical calculation based on that assumed cycle count and clock frequency; the actual latency must be measured from the implemented RTL.
-
-## Applications
-
-Potential applications include:
-
-- ECG signal preprocessing.
-- PPG signal filtering.
-- Wearable health-monitoring systems.
-- Biomedical instrumentation.
-- Low-cost real-time DSP systems.
-- FPGA-based hardware/software co-design experiments.
-
-VitalSoC is a development and research platform, not a clinically validated medical device. Its filtered outputs should not be used for diagnosis or treatment without appropriate validation.
-
-## Future Work
-
-Potential development directions include:
-
-- Complete PicoRV32 SoC integration and system-level verification.
-- Automated regression testing with a software reference model.
-- Integration with real ADC and sensor interfaces.
-- Configurable FIR coefficients and filter profiles.
-- Benchmarking against a software-only FIR implementation.
-- FPGA synthesis and timing analysis.
-- Power and area comparison across alternative architectures.
-- Integration of downstream ECG/PPG analysis algorithms.
-
-## References
-
-- [PicoRV32 RISC-V CPU](https://github.com/YosysHQ/picorv32)
-- [GitHub README documentation](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-readmes)
-
-## License
-
-Add a `LICENSE` file specifying the project's chosen license before distributing the source code as an open-source project.
+- Navneet Prasad, 3rd year ECE
+- Bejin B, 3rd year ECE
+- Ramkumar P, 3rd year ECE
 
 ## Acknowledgements
 
-VitalSoC builds on the PicoRV32 open-source RISC-V processor and explores dedicated hardware acceleration for biomedical signal processing.
+- [PicoRV32](https://github.com/YosysHQ/picorv32) by Claire Xenia Wolf, ISC licence.
+- OpenCores I2C IP.
+
