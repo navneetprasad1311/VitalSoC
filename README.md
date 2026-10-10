@@ -113,11 +113,11 @@ docs/           Register reference and design notes
 
 | Metric | Value |
 |---|---|
-| LUT / FF / DSP / BRAM | 2826/1837/1/18 |
+| LUT / FF / DSP / BRAM | 2826 / 1837 / 1 / 18 |
 | Worst negative slack at 100 MHz | 0.251ns |
-| FIR accelerator, cycles per sample | about 67 (simulation, accelerator only) |
-| Software FIR, cycles per sample | pending |
-| Speed-up | pending (estimated to be around 30x)|
+| FIR accelerator, cycles per sample | 316 cycles |
+| Software FIR, cycles per sample | 69080 cycles |
+| Speed-up | 218.6x |
 
 ## Intended applications
 
